@@ -1,0 +1,1816 @@
+# -*- coding: utf-8 -*-
+"""급등주 투자검토 우선순위 풀스크리너 v2.0
+
+중요 설계 원칙
+- v3.6.2 원본 소스 전체를 이 파일 안에 내장하고, 별도 파일로 저장하거나 편집하지 않고 그대로 실행합니다.
+- 모델/라벨/특징량/임계값 선택/홀드아웃/WFO/ATR 손절/비용 계산을 이 파일에서 재구현하거나 변경하지 않습니다.
+- 가격 데이터와 구성종목 목록은 FinanceDataReader만 사용합니다.
+- 기존 v3.6.2 모델/임계값 선택/홀드아웃/WFO/ATR 손절/비용 계산은 변경하지 않습니다.
+- 3개 그룹: 매수검토 / 관찰 / 매수제외로 모든 종목을 분류합니다.
+- 1차 기준: 분석 성공, 현재 점수 ≥ 임계값, 홀드아웃 표본 ≥ 50, 정밀도 > 기저율,
+  홀드아웃 신호 ≥ 30, 비중복 거래 ≥ 30, 평균 순수익률 > 0, CAGR > 0.
+- 1차 통과 종목은 2차 기준(정밀도 ≥ 50%, 정밀도 개선폭 ≥ 5%p,
+  독립 5차 WFO 정밀도 개선폭 ≥ 5%p, 부트스트랩 95% CI 하한 > 홀드아웃 기저율)을 적용합니다.
+- 그룹 내 순위 = 정밀도 순위 + 거래당 평균 순수익률 순위; 순위 합계가 작을수록 우선합니다.
+- 전체종합순위는 매수검토 → 관찰 → 매수제외 그룹 순서로 연결하고, 그룹별 순위는 각 그룹에서 1위부터 다시 시작합니다.
+- v3.6.2의 모델·라벨·특징량·임계값 선택·홀드아웃/WFO/거래 계산은 변경하지 않습니다.
+- 현재 모델 신호 기준(점수 ≥ 임계값)은 단일종목 v3.6.2와 동일하게 적용합니다.
+
+이 파일 하나만으로 실행할 수 있도록 v3.6.2 원본 모듈을 압축 내장했습니다.
+원본 모듈 SHA-256은 실행 설정 및 엑셀의 기준 시트에 기록됩니다.
+
+기본 설정은 v3.6.2와 동일: 목표 +15%, 최대 보유 20거래일, 수수료 0.05%/편도,
+슬리피지 0.15%/편도. 사용자가 실행 중 변경할 수는 있지만, 같은 풀스크린 비교에서는
+설정을 동일하게 유지해야 표본 분포를 공정하게 비교할 수 있습니다.
+"""
+from __future__ import annotations
+
+import contextlib
+import base64
+import datetime as dt
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import zlib
+from pathlib import Path
+from typing import Any, Optional
+
+# Excel output dependency. The v3.6.2 module installs its own dependencies.
+try:
+    if importlib.util.find_spec("openpyxl") is None:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "openpyxl"])
+except (ImportError, ValueError):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "openpyxl"])
+
+import numpy as np
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+
+SCRIPT_VERSION = "stock_screener_v2.0"
+CORE_FILENAME = "stock_analysis_v3_6_2_sample_diagnostics.py (내장 원본)"
+CORE_SOURCE_SHA256 = "7e6f22272b4f217dfcee3a43aec760559c12e68a3383d46950adf511c209b137"
+DEFAULT_TARGET_PCT = 15.0
+DEFAULT_MAX_HOLDING = 20
+DEFAULT_FEE_PCT = 0.05
+DEFAULT_SLIPPAGE_PCT = 0.15
+ATR_MULTIPLE = 2.0  # v3.6.2 run_pipeline fixed existing strategy; not changed here.
+BOOTSTRAP_REPS = 400
+BOOTSTRAP_BLOCK_LENGTH = DEFAULT_MAX_HOLDING
+
+
+CORE_SOURCE_B64_ZLIB = (
+    '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'
+)
+
+
+def load_core_module():
+    """Create an isolated module namespace from the byte-for-byte v3.6.2 source embedded below."""
+    import types
+    try:
+        core_bytes = zlib.decompress(base64.b64decode(CORE_SOURCE_B64_ZLIB))
+    except Exception as exc:
+        raise RuntimeError(f"내장 v3.6.2 원본 압축 데이터를 읽지 못했습니다: {exc}") from exc
+    actual_hash = hashlib.sha256(core_bytes).hexdigest()
+    if actual_hash != CORE_SOURCE_SHA256:
+        raise RuntimeError(
+            "내장 v3.6.2 원본의 SHA-256 검증에 실패했습니다. 파일이 손상되었을 수 있습니다."
+        )
+    source = core_bytes.decode("utf-8")
+    module_name = "v362_core_embedded_for_screener"
+    module = types.ModuleType(module_name)
+    module.__file__ = f"{globals().get('__file__', '<colab-notebook>')}::<embedded-v3.6.2>"
+    module.__package__ = ""
+    sys.modules[module_name] = module
+    exec(compile(source, module.__file__, "exec"), module.__dict__)
+    if not callable(getattr(module, "run_pipeline", None)):
+        raise RuntimeError("내장된 v3.6.2에서 run_pipeline을 찾지 못했습니다.")
+    return module
+
+
+def _safe(value: Any) -> Any:
+    """Convert NumPy/pandas values to JSON-safe standard Python types."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {str(k): _safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_safe(v) for v in value]
+    if isinstance(value, (pd.Timestamp, dt.datetime, dt.date)):
+        return value.isoformat()
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, (np.bool_, bool)):
+        return bool(value)
+    if pd.isna(value) if not isinstance(value, (str, bytes, dict, list, tuple)) else False:
+        return None
+    return value
+
+
+def _number(value: Any) -> float:
+    try:
+        x = float(value)
+        return x if np.isfinite(x) else np.nan
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _int_value(value: Any, default: int = 0) -> int:
+    try:
+        x = float(value)
+        return int(x) if np.isfinite(x) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _find_column(df: pd.DataFrame, candidates: list[str]) -> Optional[str]:
+    lookup = {str(c).strip().lower(): c for c in df.columns}
+    for wanted in candidates:
+        if wanted.strip().lower() in lookup:
+            return lookup[wanted.strip().lower()]
+    # Some FDR versions localize display headers; try normalized substring match.
+    for wanted in candidates:
+        needle = wanted.strip().lower()
+        for col in df.columns:
+            if needle in str(col).strip().lower():
+                return col
+    return None
+
+
+def load_stock_universe(core, market: str) -> tuple[pd.DataFrame, str]:
+    """Use FinanceDataReader's current index constituent listing; no Yahoo/Wikipedia scraping."""
+    if market == "S&P 500":
+        source_code = "S&P500"
+        listing = core.fdr.StockListing(source_code)
+        source = "FinanceDataReader: fdr.StockListing('S&P500')"
+        if listing is None or listing.empty:
+            raise RuntimeError("FinanceDataReader에서 S&P 500 구성 종목 목록을 가져오지 못했습니다.")
+        symbol_col = _find_column(listing, ["Symbol", "Ticker"])
+        name_col = _find_column(listing, ["Name", "Security", "Company"])
+        sector_col = _find_column(listing, ["Sector", "GICS Sector"])
+        industry_col = _find_column(listing, ["Industry", "GICS Sub-Industry", "Sub-Industry"])
+        currency = "USD"
+        if symbol_col is None:
+            raise RuntimeError(f"S&P 500 목록에서 티커 열을 찾지 못했습니다. 열: {list(listing.columns)}")
+        tickers = listing[symbol_col].astype(str).str.strip()
+    elif market == "KOSPI":
+        listing, source = None, ""
+        last_error = []
+        for source_code in ("KOSPI-DESC", "KOSPI"):
+            try:
+                candidate = core.fdr.StockListing(source_code)
+                if candidate is not None and not candidate.empty:
+                    listing = candidate.copy()
+                    source = f"FinanceDataReader: fdr.StockListing('{source_code}')"
+                    break
+            except Exception as exc:
+                last_error.append(f"{source_code}: {exc}")
+        if listing is None or listing.empty:
+            raise RuntimeError("FinanceDataReader에서 KOSPI 구성 종목 목록을 가져오지 못했습니다. " + "; ".join(last_error))
+        symbol_col = _find_column(listing, ["Code", "Symbol", "종목코드", "Ticker"])
+        name_col = _find_column(listing, ["Name", "종목명", "Company"])
+        sector_col = _find_column(listing, ["Sector", "섹터", "업종명", "업종"])
+        industry_col = _find_column(listing, ["Industry", "산업", "업종"])
+        currency = "KRW"
+        if symbol_col is None:
+            raise RuntimeError(f"KOSPI 목록에서 종목코드 열을 찾지 못했습니다. 열: {list(listing.columns)}")
+        tickers = listing[symbol_col].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(6)
+    else:
+        raise ValueError("시장 선택은 'KOSPI' 또는 'S&P 500'이어야 합니다.")
+
+    names = listing[name_col].astype(str).str.strip() if name_col else tickers.astype(str)
+    sectors = listing[sector_col].astype(str).str.strip() if sector_col else pd.Series("미분류", index=listing.index)
+    industries = listing[industry_col].astype(str).str.strip() if industry_col else sectors
+    out = pd.DataFrame({
+        "시장": market,
+        "티커": tickers.astype(str).str.strip().values,
+        "기업명": names.values,
+        "업종": sectors.values,
+        "세부업종": industries.values,
+        "통화": currency,
+        "목록출처": source,
+    })
+    out = out.replace({"nan": np.nan, "None": np.nan}).dropna(subset=["티커"])
+    out = out[out["티커"].astype(str).str.len() > 0]
+    out = out.drop_duplicates(subset=["티커"], keep="first").reset_index(drop=True)
+    return out, source
+
+
+def wilson_ci(successes: int, total: int, z: float = 1.959963984540054) -> tuple[float, float]:
+    """Wilson 95% interval in percent; shown as a simple-binomial reference only."""
+    if total <= 0 or successes < 0 or successes > total:
+        return np.nan, np.nan
+    p = successes / total
+    den = 1 + z * z / total
+    center = (p + z * z / (2 * total)) / den
+    half = z * math.sqrt((p * (1 - p) + z * z / (4 * total)) / total) / den
+    return max(0.0, (center - half) * 100), min(100.0, (center + half) * 100)
+
+
+def block_bootstrap_ci(y: np.ndarray, scores: np.ndarray, threshold: float,
+                       block_length: int = 20, reps: int = BOOTSTRAP_REPS,
+                       seed: int = 42) -> dict:
+    """Moving-block bootstrap for holdout precision/recall/F1, preserving short-run time dependence."""
+    y = np.asarray(y, dtype=int).reshape(-1)
+    scores = np.asarray(scores, dtype=float).reshape(-1)
+    if len(y) != len(scores):
+        return {"블록길이": block_length, "반복수": reps, "유효반복수": 0,
+                "정밀도_CI95_하한": np.nan, "정밀도_CI95_상한": np.nan,
+                "재현율_CI95_하한": np.nan, "재현율_CI95_상한": np.nan,
+                "F1_CI95_하한": np.nan, "F1_CI95_상한": np.nan,
+                "CI_설명": "라벨/점수 길이 불일치"}
+    valid = np.isfinite(scores) & np.isin(y, [0, 1])
+    y, scores = y[valid], scores[valid]
+    n = len(y)
+    block = min(int(block_length), n)
+    if n < 2 * max(1, int(block_length)):
+        return {"블록길이": block, "반복수": reps, "유효반복수": 0,
+                "정밀도_CI95_하한": np.nan, "정밀도_CI95_상한": np.nan,
+                "재현율_CI95_하한": np.nan, "재현율_CI95_상한": np.nan,
+                "F1_CI95_하한": np.nan, "F1_CI95_상한": np.nan,
+                "CI_설명": f"홀드아웃이 {2 * int(block_length)}개 거래일 미만이어서 20일 블록을 2개 이상 구성할 수 없음; 표본 충분/부족 판정은 아님"}
+    pred = scores >= threshold
+    rng = np.random.default_rng(seed)
+    starts_max = n - block + 1
+    chunks = int(math.ceil(n / block))
+    values = {"precision": [], "recall": [], "f1": []}
+    common_valid_reps = 0
+    for _ in range(int(reps)):
+        starts = rng.integers(0, starts_max, size=chunks)
+        idx = np.concatenate([np.arange(s, s + block) for s in starts])[:n]
+        yy, pp = y[idx], pred[idx]
+        tp = int(np.sum((yy == 1) & pp))
+        fp = int(np.sum((yy == 0) & pp))
+        fn = int(np.sum((yy == 1) & (~pp)))
+        precision = tp / (tp + fp) if tp + fp else np.nan
+        recall = tp / (tp + fn) if tp + fn else np.nan
+        f1 = 2 * precision * recall / (precision + recall) if np.isfinite(precision) and np.isfinite(recall) and precision + recall > 0 else (0.0 if np.isfinite(precision) and np.isfinite(recall) else np.nan)
+        if np.isfinite(precision): values["precision"].append(precision * 100)
+        if np.isfinite(recall): values["recall"].append(recall * 100)
+        if np.isfinite(f1): values["f1"].append(f1 * 100)
+        if np.isfinite(precision) and np.isfinite(recall) and np.isfinite(f1):
+            common_valid_reps += 1
+    def _bounds(items):
+        return (float(np.percentile(items, 2.5)), float(np.percentile(items, 97.5))) if len(items) >= max(30, reps // 3) else (np.nan, np.nan)
+    p_lo, p_hi = _bounds(values["precision"])
+    r_lo, r_hi = _bounds(values["recall"])
+    f_lo, f_hi = _bounds(values["f1"])
+    valid_reps = common_valid_reps
+    return {"블록길이": block, "반복수": reps, "유효반복수": valid_reps,
+            "정밀도_CI95_하한": p_lo, "정밀도_CI95_상한": p_hi,
+            "재현율_CI95_하한": r_lo, "재현율_CI95_상한": r_hi,
+            "F1_CI95_하한": f_lo, "F1_CI95_상한": f_hi,
+            "CI_설명": f"{block}-거래일 이동 블록 부트스트랩 95% 구간; 라벨 중첩의 단기 의존성을 일부 반영하나 장기 시장국면 의존성/생존편향까지 제거하지는 않음"}
+
+
+def _sample_stats(frame: Optional[pd.DataFrame], label_col: str = "Label") -> dict:
+    if frame is None or len(frame) == 0:
+        return {"표본수": 0, "실제급등라벨수": 0, "급등라벨비율_%": np.nan, "시작일": None, "종료일": None}
+    labels = pd.to_numeric(frame[label_col], errors="coerce") if label_col in frame else pd.Series([], dtype=float)
+    pos = int((labels == 1).sum())
+    return {"표본수": int(len(frame)), "실제급등라벨수": pos,
+            "급등라벨비율_%": pos / len(frame) * 100.0,
+            "시작일": pd.Timestamp(frame.index.min()).strftime("%Y-%m-%d"),
+            "종료일": pd.Timestamp(frame.index.max()).strftime("%Y-%m-%d")}
+
+
+def _fold_counts_without_retraining(core, development_wf: pd.DataFrame) -> list[dict]:
+    """Count the exact v3.6.2 expanding folds without fitting extra models for a failed pipeline."""
+    rows = []
+    if development_wf is None or len(development_wf) < 70:
+        return rows
+    n = len(development_wf)
+    first_test = max(50, int(n * 0.45))
+    if first_test >= n - 2:
+        return rows
+    edges = np.linspace(first_test, n, 6, dtype=int)
+    for fold_no in range(5):
+        a, b = int(edges[fold_no]), int(edges[fold_no + 1])
+        if b <= a:
+            continue
+        test = development_wf.iloc[a:b].copy()
+        if test.empty:
+            continue
+        test_start = pd.Timestamp(test.index[0])
+        train = development_wf[(development_wf.index < test_start) &
+                               (pd.to_datetime(development_wf["t1"]) < test_start)].copy()
+        train = train[train[core.FEATURES].notna().all(axis=1) & train["Label"].notna()]
+        rows.append({
+            "차수": fold_no + 1,
+            "학습표본수": int(len(train)),
+            "학습실제급등라벨수": int((train["Label"].astype(int) == 1).sum()) if len(train) else 0,
+            "학습시작일": pd.Timestamp(train.index.min()).strftime("%Y-%m-%d") if len(train) else None,
+            "학습종료일": pd.Timestamp(train.index.max()).strftime("%Y-%m-%d") if len(train) else None,
+            "검증표본수": int(len(test)),
+            "검증실제급등라벨수": int((test["Label"].astype(int) == 1).sum()),
+            "검증시작일": pd.Timestamp(test.index.min()).strftime("%Y-%m-%d"),
+            "검증종료일": pd.Timestamp(test.index.max()).strftime("%Y-%m-%d"),
+            "예측실행여부": bool(len(train) >= 30 and train["Label"].nunique() > 1),
+            "기록유형": "v3.6.2 분할 규칙으로 표본 수만 재구성(모델 예측 미실행)",
+        })
+    return rows
+
+
+def sample_diagnostics_from_raw(core, raw: pd.DataFrame, target_pct: float, max_holding: int,
+                                fee_pct: float, slippage_pct: float,
+                                captured_oof: Optional[list[dict]] = None) -> tuple[dict, list[dict]]:
+    """For runs returning None, expose counts using v3.6.2 feature/label/filter functions."""
+    if raw is None or raw.empty:
+        return {}, []
+    normalized = raw.copy()
+    normalized.index = pd.to_datetime(normalized.index)
+    if getattr(normalized.index, "tz", None) is not None:
+        normalized.index = normalized.index.tz_localize(None)
+    normalized = normalized[~normalized.index.duplicated(keep="last")].sort_index()
+    feats = core.compute_features(normalized)
+    labeled = core._make_candidate_data(feats, float(target_pct), ATR_MULTIPLE,
+                                        int(max_holding), float(fee_pct), float(slippage_pct))
+    valid = core._valid_labeled(labeled)
+    split_idx = int(len(valid) * 0.80)
+    development = valid.iloc[:split_idx].copy()
+    holdout = valid.iloc[split_idx:].copy()
+    holdout_start = pd.Timestamp(holdout.index[0]) if len(holdout) else None
+    if holdout_start is not None:
+        development_wf = development[pd.to_datetime(development["t1"]) < holdout_start].copy()
+        final_train = development[(development.index < holdout_start) &
+                                  (pd.to_datetime(development["t1"]) < holdout_start)].copy()
+    else:
+        development_wf = development.copy()
+        final_train = development.iloc[0:0].copy()
+    latest_date = pd.Timestamp(feats.index[-1]) if len(feats) else None
+    deploy_train = (valid[(valid.index < latest_date) & (pd.to_datetime(valid["t1"]) <= latest_date)].copy()
+                    if latest_date is not None else valid.iloc[0:0].copy())
+
+    oof = pd.DataFrame(captured_oof or [])
+    fold_rows = []
+    if not oof.empty and "fold" in oof:
+        for fold_no, part in oof.groupby("fold", sort=True):
+            fold_rows.append({
+                "차수": int(fold_no),
+                "학습표본수": int(pd.to_numeric(part.get("train_n"), errors="coerce").max()),
+                "학습실제급등라벨수": int(pd.to_numeric(part.get("train_positive_n"), errors="coerce").max()),
+                "학습시작일": pd.to_datetime(part.get("train_start")).min().strftime("%Y-%m-%d") if part.get("train_start") is not None else None,
+                "학습종료일": pd.to_datetime(part.get("train_end")).max().strftime("%Y-%m-%d") if part.get("train_end") is not None else None,
+                "검증표본수": int(len(part)),
+                "검증실제급등라벨수": int((pd.to_numeric(part["label"], errors="coerce") == 1).sum()),
+                "검증시작일": pd.Timestamp(pd.to_datetime(part["date"]).min()).strftime("%Y-%m-%d"),
+                "검증종료일": pd.Timestamp(pd.to_datetime(part["date"]).max()).strftime("%Y-%m-%d"),
+                "예측실행여부": True,
+                "기록유형": "v3.6.2 실제 WFO 예측에서 수집",
+            })
+    else:
+        fold_rows = _fold_counts_without_retraining(core, development_wf)
+
+    if not oof.empty and "fold" in oof:
+        max_fold = int(oof["fold"].max())
+        independent = oof[oof["fold"] == max_fold].copy()
+        val_start = pd.Timestamp(pd.to_datetime(independent["date"]).min()) if len(independent) else None
+        tuning = oof[(oof["fold"] < max_fold) & (pd.to_datetime(oof["t1"]) < val_start)].copy() if val_start is not None else oof.iloc[0:0].copy()
+        ind_stats = {"표본수": int(len(independent)),
+                     "실제급등라벨수": int((pd.to_numeric(independent.get("label"), errors="coerce") == 1).sum()),
+                     "급등라벨비율_%": float((pd.to_numeric(independent.get("label"), errors="coerce") == 1).mean() * 100) if len(independent) else np.nan,
+                     "시작일": pd.to_datetime(independent["date"]).min().strftime("%Y-%m-%d") if len(independent) else None,
+                     "종료일": pd.to_datetime(independent["date"]).max().strftime("%Y-%m-%d") if len(independent) else None}
+        tune_stats = {"표본수": int(len(tuning)),
+                      "실제급등라벨수": int((pd.to_numeric(tuning.get("label"), errors="coerce") == 1).sum()),
+                      "급등라벨비율_%": float((pd.to_numeric(tuning.get("label"), errors="coerce") == 1).mean() * 100) if len(tuning) else np.nan}
+    else:
+        ind_stats = {"표본수": 0, "실제급등라벨수": 0, "급등라벨비율_%": np.nan, "시작일": None, "종료일": None}
+        tune_stats = {"표본수": 0, "실제급등라벨수": 0, "급등라벨비율_%": np.nan}
+
+    diagnostics = {
+        "가격데이터": {"표본수": len(normalized), "시작일": normalized.index.min().strftime("%Y-%m-%d"), "종료일": normalized.index.max().strftime("%Y-%m-%d")},
+        "전체유효라벨": _sample_stats(valid),
+        "개발구간80퍼센트": _sample_stats(development),
+        "워크포워드사용가능개발구간": _sample_stats(development_wf),
+        "임계값선택용1to4차OOF": tune_stats,
+        "별도워크포워드기준5차": ind_stats,
+        "최종홀드아웃20퍼센트": _sample_stats(holdout),
+        "홀드아웃최종학습데이터": _sample_stats(final_train),
+        "최신시점재학습데이터": _sample_stats(deploy_train),
+        "워크포워드차수별": fold_rows,
+        "해석주의": "실제 급등 라벨 수는 날짜별 라벨 개수입니다. 목표기간이 겹칠 수 있어 독립 급등 사건 수와 같지 않습니다. 모델 파이프라인이 완료되지 않은 종목은 예측 성능값이 없을 수 있습니다.",
+    }
+    return diagnostics, fold_rows
+
+
+def _get_diag_count(diag: dict, section: str, key: str = "표본수") -> float:
+    value = diag.get(section, {}) if isinstance(diag, dict) else {}
+    if not isinstance(value, dict):
+        return np.nan
+    return _number(value.get(key))
+
+
+def _make_summary_row(meta: dict, status: str, reason: str, diag: dict,
+                      result: Optional[dict], ci_by_threshold: dict) -> dict:
+    hold = result.get("holdout_metrics", {}) if result else {}
+    trade = result.get("holdout_trade_metrics", {}) if result else {}
+    plain = result.get("plain_metrics", {}) if result else {}
+    thresholds = result.get("thresholds", {}) if result else {}
+    primary_ci = ci_by_threshold.get("정밀도", {})
+    def cnt(section, key="표본수"):
+        return _get_diag_count(diag, section, key)
+    return {
+        "시장": meta.get("시장"), "티커": meta.get("티커"), "기업명": meta.get("기업명"),
+        "업종": meta.get("업종"), "세부업종": meta.get("세부업종"), "분석상태": status,
+        "분석메모": reason,
+        "가격데이터수": cnt("가격데이터"), "가격시작일": diag.get("가격데이터", {}).get("시작일"), "가격종료일": diag.get("가격데이터", {}).get("종료일"),
+        "전체유효라벨표본수": cnt("전체유효라벨"), "전체유효양성수": cnt("전체유효라벨", "실제급등라벨수"),
+        "개발80표본수": cnt("개발구간80퍼센트"), "개발80양성수": cnt("개발구간80퍼센트", "실제급등라벨수"),
+        "WFO사용가능개발표본수": cnt("워크포워드사용가능개발구간"), "WFO튜닝OOF표본수": cnt("임계값선택용1to4차OOF"),
+        "WFO튜닝OOF양성수": cnt("임계값선택용1to4차OOF", "실제급등라벨수"),
+        "독립WFO표본수": cnt("별도워크포워드기준5차"), "독립WFO양성수": cnt("별도워크포워드기준5차", "실제급등라벨수"),
+        "홀드아웃표본수": cnt("최종홀드아웃20퍼센트"), "홀드아웃양성수": cnt("최종홀드아웃20퍼센트", "실제급등라벨수"),
+        "최종학습표본수": cnt("홀드아웃최종학습데이터"), "최종학습양성수": cnt("홀드아웃최종학습데이터", "실제급등라벨수"),
+        "최신재학습표본수": cnt("최신시점재학습데이터"), "최신재학습양성수": cnt("최신시점재학습데이터", "실제급등라벨수"),
+        "임계값_정밀도기준_%": thresholds.get("정밀도"), "임계값_재현율기준_%": thresholds.get("재현율"), "임계값_F1기준_%": thresholds.get("F1"),
+        "홀드아웃신호수": hold.get("예측양성수"), "홀드아웃TP": hold.get("TP"), "홀드아웃FP": hold.get("FP"),
+        "홀드아웃FN": hold.get("FN"), "홀드아웃TN": hold.get("TN"), "홀드아웃기저율_%": hold.get("기저율"),
+        "홀드아웃정밀도_%": hold.get("정밀도"), "정밀도_블록부트95하한": primary_ci.get("정밀도_CI95_하한"),
+        "정밀도_블록부트95상한": primary_ci.get("정밀도_CI95_상한"),
+        "정밀도_블록부트95너비": (_number(primary_ci.get("정밀도_CI95_상한")) - _number(primary_ci.get("정밀도_CI95_하한"))) if np.isfinite(_number(primary_ci.get("정밀도_CI95_상한"))) and np.isfinite(_number(primary_ci.get("정밀도_CI95_하한"))) else np.nan,
+        "홀드아웃재현율_%": hold.get("재현율"), "재현율_블록부트95하한": primary_ci.get("재현율_CI95_하한"),
+        "재현율_블록부트95상한": primary_ci.get("재현율_CI95_상한"), "홀드아웃F1_%": hold.get("F1"),
+        "F1_블록부트95하한": primary_ci.get("F1_CI95_하한"), "F1_블록부트95상한": primary_ci.get("F1_CI95_상한"),
+        "비중복실제거래수": trade.get("비중복거래수"), "실제수익거래수": trade.get("수익거래수"),
+        "실제손실거래수": trade.get("손실거래수"), "실제목표달성거래수": trade.get("목표달성거래수"),
+        "실제거래목표달성률_%": trade.get("목표달성률_실제거래_%"), "평균순수익률_%": trade.get("평균순수익률_%"),
+        "실제승률_%": trade.get("실제승률_%"), "CAGR_%": trade.get("CAGR"), "MDD_%": trade.get("MDD"),
+        "Calmar": trade.get("칼마비율"), "전략누적수익률_%": trade.get("전략_누적수익률_%"),
+        "현재모델점수_%": result.get("latest_probability") if result else np.nan,
+        "최종임계값_%": result.get("optimal_threshold") if result else np.nan,
+        "현재모델신호": result.get("raw_model_signal") if result else None,
+        "운용판정_v3_6_2": result.get("operating_judgement", {}).get("판정") if result else None,
+        "데이터출처": "FinanceDataReader: fdr.DataReader(ticker)",
+        "모델기준": "stock_analysis_v3_6_2_sample_diagnostics.py",
+    }
+
+
+def _segment_rows(meta: dict, diag: dict, source_type: str) -> list[dict]:
+    mapping = [
+        ("가격데이터", "가격 데이터"),
+        ("전체유효라벨", "전체 유효 라벨"),
+        ("개발구간80퍼센트", "개발 구간(약 80%)"),
+        ("워크포워드사용가능개발구간", "WFO 사용 가능 개발 구간"),
+        ("임계값선택용1to4차OOF", "임계값 튜닝 OOF(1~4차)"),
+        ("별도워크포워드기준5차", "별도 WFO 기준 구간(마지막 차수)"),
+        ("최종홀드아웃20퍼센트", "최종 홀드아웃(약 20%)"),
+        ("홀드아웃최종학습데이터", "홀드아웃 이전 최종 학습 데이터"),
+        ("최신시점재학습데이터", "최신 시점 재학습 데이터"),
+    ]
+    rows = []
+    for key, label in mapping:
+        obj = diag.get(key, {}) if isinstance(diag, dict) else {}
+        if not isinstance(obj, dict): obj = {}
+        n = obj.get("표본수")
+        pos = obj.get("실제급등라벨수", obj.get("실제급등사례", obj.get("positive_n")))
+        if key == "가격데이터": pos = np.nan
+        rows.append({
+            "시장": meta.get("시장"), "티커": meta.get("티커"), "기업명": meta.get("기업명"),
+            "구간": label, "표본수": n, "양성라벨수": pos,
+            "음성라벨수": (n - pos) if _finite_pair(n, pos) else np.nan,
+            "양성비율_%": obj.get("급등라벨비율_%", (float(pos) / float(n) * 100 if _finite_pair(n, pos) and float(n) > 0 else np.nan)),
+            "시작일": obj.get("시작일"), "종료일": obj.get("종료일"),
+            "기록유형": source_type,
+            "해석주의": diag.get("해석주의", "20거래일 목표 기간이 겹칠 수 있어 날짜별 라벨은 독립 사건 수와 같지 않음"),
+        })
+    return rows
+
+
+def _finite_pair(a, b) -> bool:
+    return np.isfinite(_number(a)) and np.isfinite(_number(b))
+
+
+def _fold_rows(meta: dict, fold_items: list[dict], source_type: str) -> list[dict]:
+    out = []
+    for item in fold_items or []:
+        out.append({
+            "시장": meta.get("시장"), "티커": meta.get("티커"), "기업명": meta.get("기업명"),
+            "차수": item.get("차수", item.get("구간번호")),
+            "학습표본수": item.get("학습표본수", item.get("학습표본수")),
+            "학습양성라벨수": item.get("학습실제급등라벨수", item.get("학습실제급등사례수")),
+            "학습시작일": item.get("학습시작일", item.get("학습시작")),
+            "학습종료일": item.get("학습종료일", item.get("학습종료")),
+            "검증표본수": item.get("검증표본수", item.get("표본수")),
+            "검증양성라벨수": item.get("검증실제급등라벨수", item.get("검증실제급등사례수")),
+            "검증시작일": item.get("검증시작일", item.get("검증시작")),
+            "검증종료일": item.get("검증종료일", item.get("검증종료")),
+            "예측실행여부": item.get("예측실행여부", True),
+            "기록유형": item.get("기록유형", source_type),
+            "정밀도_%": item.get("정밀도"), "재현율_%": item.get("재현율"), "F1_%": item.get("F1"),
+        })
+    return out
+
+
+def _threshold_rows(core, meta: dict, result: dict, seed: int, block_length: int = DEFAULT_MAX_HOLDING) -> tuple[list[dict], dict]:
+    rows, ci_by_name = [], {}
+    y = result.get("_raw_holdout_y")
+    scores = result.get("_raw_holdout_p")
+    if y is None or scores is None:
+        return rows, ci_by_name
+    for name in ("정밀도", "재현율", "F1"):
+        threshold_pct = _number(result.get("thresholds", {}).get(name))
+        if not np.isfinite(threshold_pct):
+            continue
+        threshold = threshold_pct / 100.0
+        metrics = core.metrics_report(np.asarray(y, dtype=int), np.asarray(scores, dtype=float), threshold, "최종 홀드아웃")
+        ci = block_bootstrap_ci(np.asarray(y, dtype=int), np.asarray(scores, dtype=float), threshold,
+                                block_length=block_length, reps=BOOTSTRAP_REPS,
+                                seed=(seed + zlib.crc32(name.encode("utf-8"))) & 0xFFFFFFFF)
+        ci_by_name[name] = ci
+        sig_n = _int_value(metrics.get("예측양성수"))
+        tp = _int_value(metrics.get("TP"))
+        fp = _int_value(metrics.get("FP"))
+        fn = _int_value(metrics.get("FN"))
+        p_lo, p_hi = wilson_ci(tp, tp + fp)
+        r_lo, r_hi = wilson_ci(tp, tp + fn)
+        rows.append({
+            "시장": meta.get("시장"), "티커": meta.get("티커"), "기업명": meta.get("기업명"),
+            "임계값선택목표": name, "임계값_%": threshold_pct,
+            "홀드아웃표본수": metrics.get("표본수"), "실제양성수": metrics.get("실제양성수"),
+            "예측매수신호수": sig_n, "TP_신호중성공": tp, "FP_신호중실패": fp,
+            "FN_놓친양성": fn, "TN": metrics.get("TN"), "기저율_%": metrics.get("기저율"),
+            "정밀도_%": metrics.get("정밀도"), "정밀도_Wilson95_하한_독립가정": p_lo,
+            "정밀도_Wilson95_상한_독립가정": p_hi,
+            "정밀도_블록부트95하한": ci.get("정밀도_CI95_하한"), "정밀도_블록부트95상한": ci.get("정밀도_CI95_상한"),
+            "재현율_%": metrics.get("재현율"), "재현율_Wilson95_하한_독립가정": r_lo,
+            "재현율_Wilson95_상한_독립가정": r_hi,
+            "재현율_블록부트95하한": ci.get("재현율_CI95_하한"), "재현율_블록부트95상한": ci.get("재현율_CI95_상한"),
+            "F1_%": metrics.get("F1"), "F1_블록부트95하한": ci.get("F1_CI95_하한"),
+            "F1_블록부트95상한": ci.get("F1_CI95_상한"),
+            "블록길이_거래일": ci.get("블록길이"), "부트스트랩반복수": ci.get("반복수"),
+            "부트스트랩유효반복수": ci.get("유효반복수"), "CI해석": ci.get("CI_설명"),
+            "비고": "Wilson 구간은 독립 시행 가정의 참고치이며, 중첩 라벨을 고려한 해석에는 블록 부트스트랩 구간을 함께 확인",
+        })
+    return rows, ci_by_name
+
+
+def _checkpoint_save(path: Path, config: dict, records: dict) -> None:
+    payload = {"version": SCRIPT_VERSION, "config": _safe(config), "records": _safe(records),
+               "saved_at": dt.datetime.now().isoformat(timespec="seconds")}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, allow_nan=False), encoding="utf-8")
+    os.replace(temp, path)
+
+
+def _checkpoint_load(path: Path, expected_config: dict) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        # v2.0 changes classification, ranking, and Excel reporting only; embedded v3.6.2 model calculations remain unchanged.
+        # Existing v1.2.x checkpoints may be reused only when substantive settings match exactly.
+        if payload.get("version") not in {"stock_screener_v1.2", "stock_screener_v1.2.2", "stock_screener_v1.2.3", SCRIPT_VERSION}:
+            return None
+        old = payload.get("config", {})
+        compare_keys = ["시장", "목표수익률_%", "최대보유거래일", "수수료_%_편도", "슬리피지_%_편도", "유니버스_SHA256", "v3_6_2_SHA256"]
+        if any(old.get(k) != expected_config.get(k) for k in compare_keys):
+            return None
+        return payload.get("records")
+    except Exception:
+        return None
+
+
+def _save_excel(path: Path, sheets: dict[str, pd.DataFrame], title_meta: dict) -> None:
+    """Write atomically, reopen the workbook, and verify the expected sheets and data exist."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.stem + ".writing.xlsx")
+    if temp.exists(): temp.unlink()
+    with pd.ExcelWriter(temp, engine="openpyxl") as writer:
+        for name, frame in sheets.items():
+            df = frame.copy() if isinstance(frame, pd.DataFrame) else pd.DataFrame(frame)
+            if df.empty and len(df.columns) == 0:
+                df = pd.DataFrame({"안내": ["해당 데이터가 없습니다."]})
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+
+    wb = load_workbook(temp)
+    header_fill = PatternFill("solid", fgColor="17365D")
+    header_font = Font(name="맑은 고딕", size=10, bold=True, color="FFFFFF")
+    body_font = Font(name="맑은 고딕", size=9, color="222222")
+    thin_gray = Side(style="thin", color="D9E2F3")
+    for ws in wb.worksheets:
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions if ws.max_row >= 1 else None
+        ws.sheet_view.showGridLines = False
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.border = Border(bottom=Side(style="medium", color="8EA9DB"))
+        ws.row_dimensions[1].height = 32
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.font = body_font
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = Border(bottom=thin_gray)
+        for col_idx, col_cells in enumerate(ws.columns, start=1):
+            letter = get_column_letter(col_idx)
+            header = str(ws.cell(1, col_idx).value or "")
+            max_len = min(max([len(str(c.value)) if c.value is not None else 0 for c in list(col_cells)[:250]] + [len(header)]) + 2, 42)
+            if any(k in header for k in ("메모", "해석", "비고", "설명", "출처", "판정기준")):
+                max_len = min(max(max_len, 28), 48)
+            else:
+                max_len = max(10, min(max_len, 24))
+            ws.column_dimensions[letter].width = max_len
+        # Date/percentage formats for the most common columns.
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                h = str(ws.cell(1, cell.column).value or "")
+                if h.endswith("일") or "시작일" in h or "종료일" in h:
+                    if isinstance(cell.value, (dt.datetime, dt.date)):
+                        cell.number_format = "yyyy-mm-dd"
+                if "%" in h or "비율" in h:
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = "0.00"
+    wb.properties.title = "급등주 투자검토 우선순위 풀스크리너 v2.0"
+    wb.properties.subject = "FinanceDataReader + v3.6.2 기준 투자 검토 우선순위 스크리닝"
+    wb.properties.creator = "OpenAI"
+    wb.save(temp)
+    wb.close()
+
+    # Validate actual .xlsx file, not just successful writer return.
+    if not temp.exists() or temp.stat().st_size < 5000:
+        raise IOError(f"엑셀 임시파일이 비정상적으로 작습니다: {temp}")
+    check = load_workbook(temp, read_only=True, data_only=False)
+    expected = set(sheets.keys())
+    missing = expected - set(check.sheetnames)
+    if missing:
+        check.close()
+        raise IOError(f"엑셀 검증 실패: 시트 누락 {sorted(missing)}")
+    for name, frame in sheets.items():
+        ws = check[name[:31]]
+        if frame is not None and len(frame) > 0 and ws.max_row < 2:
+            check.close()
+            raise IOError(f"엑셀 검증 실패: '{name}' 시트에 데이터 행이 없습니다.")
+    check.close()
+    os.replace(temp, path)
+
+
+def build_criteria_sheet(core_hash: str, universe_source: str, block_length: int = DEFAULT_MAX_HOLDING) -> pd.DataFrame:
+    rows = [
+        (1, "전체 유효 라벨 표본", "v3.6.2의 compute_features → _make_candidate_data → _valid_labeled 결과", "전체 유효 라벨 표본과 실제 급등 라벨 수", "종목별 데이터 이력의 폭을 확인", "20거래일 목표 기간이 중첩될 수 있어 행 수가 독립 급등 사건 수와 같지는 않음"),
+        (2, "개발 구간 표본", "유효 라벨의 앞쪽 약 80% 분할", "개발 표본/실제 급등 라벨 수", "학습에 사용할 수 있었던 표본 규모 확인", "최종 홀드아웃 시작 시점 이후 결과가 알려지는 라벨은 v3.6.2의 purging에서 제외"),
+        (3, "최종 홀드아웃", "유효 라벨의 뒤쪽 약 20%", "홀드아웃 분류 표본/실제 급등 라벨 수", "미사용 평가 구간 규모 확인", "표본 수만으로 성능이 좋다고 판정하지 않음"),
+        (4, "임계값 튜닝 OOF", "v3.6.2의 WFO 중 마지막 기준 fold 이전, 라벨 확정일 조건 반영", "OOF 표본/실제 급등 라벨 수", "임계값 선택 근거의 표본 폭 확인", "임계값 개발에 사용되므로 완전히 독립된 성능 추정치가 아님"),
+        (5, "독립 WFO 기준 구간", "v3.6.2에서 임계값 선택에 사용하지 않는 마지막 WFO fold", "표본/실제 급등 라벨 수/날짜 범위", "홀드아웃 이전의 별도 검증 표본 확인", "단일 종목 시계열의 시장 국면 의존성을 완전히 제거하지 않음"),
+        (6, "홀드아웃 신호/분류 성능", "정밀도 기준 임계값을 홀드아웃에 적용한 v3.6.2 결과", "홀드아웃 매수 신호, TP/FP/FN/TN, 홀드아웃 정밀도·재현율·F1", "분류 성능과 표본 규모를 함께 확인", "이 스크리너는 새로운 임계값을 학습하지 않음"),
+        (7, "성능 불확실성", f"Wilson 95% 구간 및 {block_length}거래일 이동 블록 부트스트랩 95% 구간", "정밀도/재현율/F1의 신뢰구간 및 너비", "추정 불확실성을 참고", "Wilson은 독립 시행 가정의 참고치이며 블록 부트스트랩도 장기 시장국면 의존성을 완전히 해결하지는 않음"),
+        (8, "실제 전략 거래성과", "v3.6.2 홀드아웃 거래 백테스트", "비중복 실제 거래, 평균 순수익률(비용 차감), CAGR, MDD, Calmar 비율", "분류 성능과 실제 거래성과를 구분", "수수료·슬리피지는 설정 반영; 미국 주식 환율 효과는 v3.6.2와 같이 별도 미반영"),
+        (9, "1차/2차 스크리닝", "1차 기준 실패=매수제외; 1차 통과 후 2차 기준 모두 통과=매수검토, 일부 실패=관찰", "그룹과 판정 사유", "분류 일관성", "분류 기준은 매수추천을 보장하지 않으며 백테스트 한계가 남음"),
+        (10, "그룹별 우선순위", "정밀도 순위 + 거래당 평균 순수익률 순위 합계 오름차순", "그룹별 순위 및 각 지표 순위", "같은 그룹 내 비교", "동점이면 평균 순수익률, 그다음 정밀도 순으로 비교; MDD/Calmar는 순위 점수에 넣지 않음"),
+        (11, "전체 종합순위", "매수검토 → 관찰 → 매수제외; 그룹별 순위를 그룹 안에서 별도 부여", "전체 종합순위 1~N", "전체 목록 정렬", "전체 종합순위는 그룹 간 성과점수 비교가 아니라 그룹 우선순위에 따른 연결 번호"),
+        (12, "데이터 출처", "FinanceDataReader API만 호출", "목록: fdr.StockListing / 가격: fdr.DataReader", "시장 선택에 따른 종목 목록과 가격 데이터 사용", "현재 구성종목 목록 기준이므로 생존편향이 남을 수 있음"),
+        (13, "모델 원본", CORE_FILENAME, f"SHA-256: {core_hash}", "내장 v3.6.2 원본 모듈 사용", "v3.6.2 모델 학습·라벨·특징량·임계값 산출·홀드아웃/WFO·거래 계산 로직은 수정하지 않음"),
+        (14, "종목 목록 출처", universe_source, "FinanceDataReader 구성종목 목록", "시장 선택에 따라 해당 FDR 목록 사용", "데이터 제공처의 변경·누락은 실행 로그를 확인"),
+    ]
+    return pd.DataFrame(rows, columns=["우선순위", "항목", "분류/산출 기준", "엑셀 출력 데이터", "해석 목적", "주의사항"])
+
+def _distribution_table(summary_df: pd.DataFrame) -> pd.DataFrame:
+    metrics = [
+        ("전체유효라벨표본수", "전체 유효 라벨 표본"),
+        ("개발80표본수", "개발 표본"),
+        ("개발80양성수", "개발 양성 라벨 수"),
+        ("홀드아웃표본수", "홀드아웃 표본"),
+        ("홀드아웃양성수", "홀드아웃 양성 라벨 수"),
+        ("독립WFO표본수", "독립 WFO 표본"),
+        ("독립WFO양성수", "독립 WFO 양성 라벨 수"),
+        ("홀드아웃신호수", "홀드아웃 매수 신호 수"),
+        ("비중복실제거래수", "비중복 실제 거래 수"),
+        ("홀드아웃정밀도_%", "홀드아웃 정밀도 (%)"),
+        ("홀드아웃재현율_%", "홀드아웃 재현율 (%)"),
+        ("홀드아웃F1_%", "홀드아웃 F1 (%)"),
+        ("정밀도_블록부트95상한", "정밀도 CI 상한 (%)"),
+    ]
+    rows = []
+    for col, label in metrics:
+        if col not in summary_df:
+            continue
+        s = pd.to_numeric(summary_df[col], errors="coerce").dropna()
+        rows.append({"지표": label, "유효종목수": int(len(s)), "최솟값": s.min() if len(s) else np.nan,
+                     "P10": s.quantile(0.10) if len(s) else np.nan, "P25": s.quantile(0.25) if len(s) else np.nan,
+                     "중앙값_P50": s.quantile(0.50) if len(s) else np.nan, "P75": s.quantile(0.75) if len(s) else np.nan,
+                     "P90": s.quantile(0.90) if len(s) else np.nan, "최댓값": s.max() if len(s) else np.nan,
+                     "해석": "시장·종목 간 관측 분포 요약; 이 분위수 자체를 자동 합격 기준으로 사용하지 않음"})
+    return pd.DataFrame(rows)
+
+
+
+def _finite_num(value: Any) -> bool:
+    try:
+        return bool(np.isfinite(float(value)))
+    except (TypeError, ValueError):
+        return False
+
+
+def _independent_wfo_map(wfo_df: Optional[pd.DataFrame]) -> dict[str, dict[str, float]]:
+    """Return independent fifth-fold WFO precision, base rate, and lift by ticker.
+
+    The final (fifth) fold is the independent WFO fold and is not used to choose
+    the model's precision threshold. The WFO lift is precision minus the label
+    base rate within that same fold.
+    """
+    if wfo_df is None or not isinstance(wfo_df, pd.DataFrame) or wfo_df.empty:
+        return {}
+    folds = wfo_df.copy()
+    required = {"티커", "차수", "검증표본수", "검증양성라벨수", "정밀도_%"}
+    if not required.issubset(folds.columns):
+        return {}
+    folds["차수"] = pd.to_numeric(folds["차수"], errors="coerce")
+    folds["검증표본수"] = pd.to_numeric(folds["검증표본수"], errors="coerce")
+    folds["검증양성라벨수"] = pd.to_numeric(folds["검증양성라벨수"], errors="coerce")
+    folds["정밀도_%"] = pd.to_numeric(folds["정밀도_%"], errors="coerce")
+    if "예측실행여부" in folds.columns:
+        ran = folds["예측실행여부"].astype(str).str.strip().str.lower().isin({"true", "1", "yes", "y"})
+        folds = folds[ran]
+    # v3.6.2's independent WFO evaluation is explicitly the fifth fold.
+    folds = folds[folds["차수"] == 5].copy()
+    output: dict[str, dict[str, float]] = {}
+    for _, r in folds.iterrows():
+        ticker = str(r.get("티커", "")).strip()
+        n = r.get("검증표본수", np.nan)
+        positive_n = r.get("검증양성라벨수", np.nan)
+        precision = r.get("정밀도_%", np.nan)
+        base = (float(positive_n) / float(n) * 100.0) if _finite_pair(n, positive_n) and float(n) > 0 else np.nan
+        lift = float(precision) - base if _finite_num(precision) and _finite_num(base) else np.nan
+        if ticker:
+            output[ticker] = {
+                "WFO정밀도_%": float(precision) if _finite_num(precision) else np.nan,
+                "WFO기저율_%": base,
+                "WFO정밀도개선폭_%p": lift,
+                "WFO검증표본수": float(n) if _finite_num(n) else np.nan,
+            }
+    return output
+
+
+def _screen_universe(summary_df: pd.DataFrame, wfo_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Classify each ticker into three groups, rank within group, then assign global order.
+
+    The embedded v3.6.2 model calculations are intentionally untouched. All rank
+    fields are reporting-layer calculations over holdout precision and net return.
+    """
+    df = summary_df.copy().reset_index(drop=True)
+    output_columns = [
+        "현재점수_임계값충족", "홀드아웃정밀도_기저율초과_%p", "스크리닝후보여부",
+        "현재모델신호", "1차스크린통과", "2차스크린통과", "스크리닝그룹", "스크리닝판정사유",
+        "WFO정밀도_%", "WFO기저율_%", "WFO정밀도개선폭_%p", "WFO검증표본수",
+        "정밀도순위", "평균순수익률순위", "순위합계", "순위산정상태", "그룹별순위", "전체종합순위",
+    ]
+    if df.empty:
+        for col in output_columns:
+            if col not in df.columns:
+                df[col] = pd.Series(dtype=object)
+        return df
+
+    numeric_cols = [
+        "현재모델점수_%", "최종임계값_%", "홀드아웃표본수", "홀드아웃신호수",
+        "비중복실제거래수", "홀드아웃정밀도_%", "홀드아웃기저율_%",
+        "정밀도_블록부트95하한", "평균순수익률_%", "CAGR_%",
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = np.nan
+
+    wfo_map = _independent_wfo_map(wfo_df)
+    for col in ("WFO정밀도_%", "WFO기저율_%", "WFO정밀도개선폭_%p", "WFO검증표본수"):
+        df[col] = df["티커"].astype(str).map(lambda t: wfo_map.get(t, {}).get(col, np.nan))
+
+    score_passes: list[bool] = []
+    precision_lifts: list[float] = []
+    first_passes: list[bool] = []
+    second_passes: list[bool] = []
+    groups: list[str] = []
+    reasons: list[str] = []
+    current_signals: list[Optional[str]] = []
+
+    for _, row in df.iterrows():
+        status = str(row.get("분석상태", "")).strip()
+        score = row.get("현재모델점수_%", np.nan)
+        threshold = row.get("최종임계값_%", np.nan)
+        n = row.get("홀드아웃표본수", np.nan)
+        signal_n = row.get("홀드아웃신호수", np.nan)
+        trade_n = row.get("비중복실제거래수", np.nan)
+        precision = row.get("홀드아웃정밀도_%", np.nan)
+        baseline = row.get("홀드아웃기저율_%", np.nan)
+        ci_lower = row.get("정밀도_블록부트95하한", np.nan)
+        avg_net = row.get("평균순수익률_%", np.nan)
+        cagr = row.get("CAGR_%", np.nan)
+        wfo_lift = row.get("WFO정밀도개선폭_%p", np.nan)
+        lift = float(precision) - float(baseline) if _finite_num(precision) and _finite_num(baseline) else np.nan
+
+        # Match v3.6.2 current-signal comparison exactly: score >= chosen threshold.
+        score_ok = _finite_num(score) and _finite_num(threshold) and float(score) >= float(threshold)
+        if _finite_num(score) and _finite_num(threshold):
+            current_signal = "추가 관찰 후보" if score_ok else "탐지 신호 없음"
+        else:
+            old_signal = row.get("현재모델신호")
+            current_signal = old_signal if old_signal in {"추가 관찰 후보", "탐지 신호 없음"} else None
+
+        first_checks: list[tuple[bool, str]] = [
+            (status == "성공", f"분석 상태가 성공이 아님({status or '미기록'})"),
+            (bool(score_ok), f"현재 모델 점수({float(score):.2f}%)가 임계값({float(threshold):.2f}%) 미만" if _finite_num(score) and _finite_num(threshold) else "현재 모델 점수 또는 임계값 계산 불가"),
+            (_finite_num(n) and float(n) >= 50, f"홀드아웃 분류 표본 {int(float(n))}개로 50개 미만" if _finite_num(n) else "홀드아웃 분류 표본 계산 불가"),
+            (_finite_num(precision) and _finite_num(baseline) and float(precision) > float(baseline), "홀드아웃 정밀도가 기저율을 초과하지 못함" if _finite_num(precision) and _finite_num(baseline) else "홀드아웃 정밀도 또는 기저율 계산 불가"),
+            (_finite_num(signal_n) and float(signal_n) >= 30, f"홀드아웃 매수 신호 {int(float(signal_n))}개로 30개 미만" if _finite_num(signal_n) else "홀드아웃 매수 신호 수 계산 불가"),
+            (_finite_num(trade_n) and float(trade_n) >= 30, f"비중복 실제 거래 {int(float(trade_n))}건으로 30건 미만" if _finite_num(trade_n) else "비중복 실제 거래 수 계산 불가"),
+            (_finite_num(avg_net) and float(avg_net) > 0, f"평균 순수익률({float(avg_net):.2f}%)이 0% 초과가 아님" if _finite_num(avg_net) else "평균 순수익률 계산 불가"),
+            (_finite_num(cagr) and float(cagr) > 0, f"CAGR({float(cagr):.2f}%)이 0% 초과가 아님" if _finite_num(cagr) else "CAGR 계산 불가"),
+        ]
+        failed_first = [message for ok, message in first_checks if not ok]
+        first_pass = len(failed_first) == 0
+
+        second_checks: list[tuple[bool, str]] = [
+            (_finite_num(precision) and float(precision) >= 50.0, f"홀드아웃 정밀도 {float(precision):.2f}%가 50% 미만" if _finite_num(precision) else "홀드아웃 정밀도 계산 불가"),
+            (_finite_num(lift) and float(lift) >= 5.0, f"정밀도 개선폭 {float(lift):.2f}%p가 +5%p 미만" if _finite_num(lift) else "정밀도 개선폭 계산 불가"),
+            (_finite_num(wfo_lift) and float(wfo_lift) >= 5.0, f"독립 5차 WFO 정밀도 개선폭 {float(wfo_lift):.2f}%p가 +5%p 미만" if _finite_num(wfo_lift) else "독립 5차 WFO 정밀도 개선폭 계산 불가"),
+            (_finite_num(ci_lower) and _finite_num(baseline) and float(ci_lower) > float(baseline), f"홀드아웃 정밀도 부트스트랩 95% CI 하한({float(ci_lower):.2f}%)이 기저율({float(baseline):.2f}%)을 초과하지 못함" if _finite_num(ci_lower) and _finite_num(baseline) else "홀드아웃 정밀도 부트스트랩 95% CI 하한 또는 기저율 계산 불가"),
+        ]
+        failed_second = [message for ok, message in second_checks if not ok]
+        second_pass = first_pass and len(failed_second) == 0
+        if not first_pass:
+            group = "매수제외"
+            reason = "1차 기준 미충족: " + " / ".join(failed_first)
+        elif second_pass:
+            group = "매수검토"
+            reason = "1차·2차 스크리닝 기준 모두 충족"
+        else:
+            group = "관찰"
+            reason = "1차 통과; 2차 기준 미충족: " + " / ".join(failed_second)
+
+        score_passes.append(bool(score_ok))
+        precision_lifts.append(lift)
+        first_passes.append(bool(first_pass))
+        second_passes.append(bool(second_pass))
+        groups.append(group)
+        reasons.append(reason)
+        current_signals.append(current_signal)
+
+    df["현재모델신호"] = current_signals
+    df["현재점수_임계값충족"] = score_passes
+    df["홀드아웃정밀도_기저율초과_%p"] = precision_lifts
+    df["1차스크린통과"] = first_passes
+    df["2차스크린통과"] = second_passes
+    df["스크리닝후보여부"] = first_passes  # compatibility: means 1차 screen passed (관찰 + 매수검토)
+    df["스크리닝그룹"] = groups
+    df["스크리닝판정사유"] = reasons
+
+    # Metric ranks and rank sums are independently computed inside each group.
+    ranked_groups: list[pd.DataFrame] = []
+    df["정밀도순위"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
+    df["평균순수익률순위"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
+    df["순위합계"] = np.nan
+    df["순위산정상태"] = "산정 불가: 정밀도와 평균 순수익률 모두 없음"
+    df["그룹별순위"] = pd.Series(pd.NA, index=df.index, dtype="Int64")
+
+    for group_name in ("매수검토", "관찰", "매수제외"):
+        idx = df.index[df["스크리닝그룹"] == group_name]
+        if len(idx) == 0:
+            continue
+        p = pd.to_numeric(df.loc[idx, "홀드아웃정밀도_%"], errors="coerce")
+        r = pd.to_numeric(df.loc[idx, "평균순수익률_%"], errors="coerce")
+        p_valid = p.dropna()
+        r_valid = r.dropna()
+        if len(p_valid):
+            df.loc[p_valid.index, "정밀도순위"] = p_valid.rank(method="min", ascending=False).astype("Int64")
+        if len(r_valid):
+            df.loc[r_valid.index, "평균순수익률순위"] = r_valid.rank(method="min", ascending=False).astype("Int64")
+        # Explicitly compute rank sums only when both metrics are present.
+        for ridx in idx:
+            if pd.notna(df.at[ridx, "정밀도순위"]) and pd.notna(df.at[ridx, "평균순수익률순위"]):
+                df.at[ridx, "순위합계"] = int(df.at[ridx, "정밀도순위"]) + int(df.at[ridx, "평균순수익률순위"])
+                df.at[ridx, "순위산정상태"] = "정상: 두 지표 모두 사용"
+            elif pd.notna(df.at[ridx, "정밀도순위"]) or pd.notna(df.at[ridx, "평균순수익률순위"]):
+                df.at[ridx, "순위산정상태"] = "부분: 한 지표만 사용 가능; 그룹 내 후순위 배치"
+
+        sub = df.loc[idx].copy()
+        sub["_완전순위"] = sub["순위합계"].notna().astype(int)
+        # Complete rows: rank-sum ASC, then actual average net return DESC, then precision DESC.
+        # Incomplete rows are last and use whichever metric is available as a visible fallback.
+        sub = sub.sort_values(
+            ["_완전순위", "순위합계", "평균순수익률_%", "홀드아웃정밀도_%", "티커"],
+            ascending=[False, True, False, False, True], na_position="last", kind="mergesort"
+        ).drop(columns=["_완전순위"])
+        sub["그룹별순위"] = pd.Series(range(1, len(sub) + 1), index=sub.index, dtype="Int64")
+        ranked_groups.append(sub)
+
+    if ranked_groups:
+        result = pd.concat(ranked_groups, axis=0).reset_index(drop=True)
+    else:
+        result = df.copy().reset_index(drop=True)
+    result["전체종합순위"] = pd.Series(range(1, len(result) + 1), index=result.index, dtype="Int64")
+    return result
+
+
+def build_screening_criteria_sheet() -> pd.DataFrame:
+    rows = [
+        (1, "1차 기준: 분석/현재 신호", "분석상태=성공 AND 현재 모델 점수 ≥ 임계값", "원본 v3.6.2의 최신 신호 판정과 동일한 비교 연산자 사용"),
+        (2, "1차 기준: 홀드아웃 표본", "홀드아웃 분류 표본 ≥ 50", "필수 평가 표본 수"),
+        (3, "1차 기준: 예측 성능", "홀드아웃 정밀도 > 같은 홀드아웃 기저율", "기본 발생률보다 정밀도가 높아야 함"),
+        (4, "1차 기준: 신호 수", "홀드아웃 매수 신호 ≥ 30", "매수 신호가 너무 적은 경우 제외"),
+        (5, "1차 기준: 실제 거래 수", "홀드아웃 비중복 실제 거래 ≥ 30", "실제 거래 성과를 평가할 최소 표본"),
+        (6, "1차 기준: 실제 수익성", "평균 순수익률(비용 차감) > 0 AND CAGR > 0", "비용 차감 후 평균 거래성과와 연환산 수익성이 모두 양수"),
+        (7, "2차 기준: 정밀도", "홀드아웃 정밀도 ≥ 50%", "1차 통과 종목에만 적용"),
+        (8, "2차 기준: 홀드아웃 개선폭", "홀드아웃 정밀도 - 홀드아웃 기저율 ≥ +5%p", "절대 정밀도뿐 아니라 기본 발생률 대비 개선폭 확인"),
+        (9, "2차 기준: 독립 WFO 개선폭", "독립 5차 WFO 정밀도 - 독립 5차 WFO 기저율 ≥ +5%p", "임계값 선택에 사용하지 않는 마지막 WFO 구간. 없으면 2차 통과 불가"),
+        (10, "2차 기준: 정밀도 불확실성", "홀드아웃 정밀도 이동 블록 부트스트랩 95% CI 하한 > 홀드아웃 기저율", "신뢰구간 하한이 기준 발생률을 엄격히 초과해야 함"),
+        (11, "그룹 분류", "1차 실패=매수제외; 1차 통과+2차 통과=매수검토; 1차 통과+2차 실패=관찰", "모든 종목은 세 그룹 중 하나에 배정"),
+        (12, "그룹 내 순위", "정밀도 순위 + 거래당 평균 순수익률 순위; 순위 합계 오름차순", "두 순위의 합계가 낮을수록 우선. 합계 동률이면 평균 순수익률, 그다음 정밀도, 마지막으로 티커 오름차순"),
+        (13, "전체 종합순위", "매수검토 → 관찰 → 매수제외; 그룹 안에서는 그룹별 순위", "각 그룹 순위는 1위부터 재시작; 전체 종합순위는 1부터 연속 부여"),
+        (14, "결측 지표", "순위합계 산정 불가; 그룹 안에서 지표가 모두 있는 종목 뒤에 배치", "그룹별 순위와 전체 종합순위는 표시하되 순위 산정 상태를 함께 표시"),
+        (15, "원본 모델", "내장 v3.6.2 원본 그대로 사용", f"SHA-256: {CORE_SOURCE_SHA256}; 모델 학습/라벨/특징량/전략 계산은 변경하지 않음"),
+    ]
+    return pd.DataFrame(rows, columns=["우선순위", "평가항목", "적용 기준", "설명"])
+
+
+def _rename_display_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Use user-facing labels for the Excel report."""
+    rename = {
+        "현재모델점수_%": "모델 점수(보정된 성공확률 아님)",
+        "최종임계값_%": "정밀도 기준 임계값",
+        "현재모델신호": "현재 모델 신호",
+        "운용판정_v3_6_2": "원본 v3.6.2 운용 판정",
+        "홀드아웃표본수": "홀드아웃 분류 표본",
+        "홀드아웃신호수": "홀드아웃 매수 신호",
+        "비중복실제거래수": "비중복 실제 거래",
+        "홀드아웃정밀도_%": "홀드아웃 정밀도",
+        "홀드아웃기저율_%": "홀드아웃 기저율",
+        "홀드아웃정밀도_기저율초과_%p": "홀드아웃 정밀도 개선폭",
+        "홀드아웃재현율_%": "홀드아웃 재현율",
+        "홀드아웃F1_%": "홀드아웃 F1",
+        "홀드아웃양성수": "홀드아웃 실제 급등 라벨 수",
+        "홀드아웃TP": "TP",
+        "홀드아웃FP": "FP",
+        "홀드아웃FN": "FN",
+        "홀드아웃TN": "TN",
+        "평균순수익률_%": "평균 순수익률(비용 차감)",
+        "CAGR_%": "CAGR",
+        "MDD_%": "MDD",
+        "Calmar": "Calmar 비율",
+        "칼마비율": "Calmar 비율",
+        "실제승률_%": "실제 승률(비용 차감 후 순수익률 > 0)",
+        "현재점수_임계값충족": "현재 모델 신호 기준 충족",
+        "정밀도_블록부트95하한": "정밀도 95% CI 하한(블록 부트스트랩)",
+        "스크리닝후보여부": "1차 스크린 통과(매수검토+관찰)",
+        "스크리닝판정사유": "분류 사유",
+        "1차스크린통과": "1차 스크린 통과",
+        "2차스크린통과": "2차 스크린 통과",
+        "스크리닝그룹": "스크리닝 그룹",
+        "WFO정밀도_%": "독립 5차 WFO 정밀도",
+        "WFO기저율_%": "독립 5차 WFO 기저율",
+        "WFO정밀도개선폭_%p": "독립 5차 WFO 정밀도 개선폭(%p)",
+        "WFO검증표본수": "독립 5차 WFO 검증 표본",
+        "정밀도순위": "정밀도 순위(그룹 내)",
+        "평균순수익률순위": "평균 순수익률 순위(그룹 내)",
+        "순위합계": "순위 합계",
+        "순위산정상태": "순위 산정 상태",
+        "그룹별순위": "그룹별 순위",
+        "전체종합순위": "전체 종합순위",
+    }
+    return frame.rename(columns={k: v for k, v in rename.items() if k in frame.columns})
+
+
+def build_workbook(output_path: Path, records: dict, config: dict, core_hash: str, universe_source: str) -> None:
+    raw_summary = pd.DataFrame(records.get("summary", []))
+    if raw_summary.empty:
+        raw_summary = pd.DataFrame(columns=["시장", "티커", "기업명", "분석상태", "전체유효라벨표본수"])
+
+    raw_wfo = pd.DataFrame(records.get("folds", []))
+    screened = _screen_universe(raw_summary, raw_wfo)
+    raw_eligible = screened[screened.get("1차스크린통과", pd.Series(False, index=screened.index)).fillna(False).astype(bool)].copy()
+    group_counts = screened.get("스크리닝그룹", pd.Series(dtype=str)).value_counts().to_dict()
+    summary_for_distribution = raw_summary.copy()
+    dist = _distribution_table(summary_for_distribution)
+    succeeded = int((raw_summary.get("분석상태", pd.Series(dtype=str)) == "성공").sum()) if len(raw_summary) else 0
+    data_diag = int(raw_summary.get("전체유효라벨표본수", pd.Series(dtype=float)).notna().sum()) if len(raw_summary) else 0
+    failures = int((raw_summary.get("분석상태", pd.Series(dtype=str)).astype(str).str.contains("실패|오류|수집", regex=True)).sum()) if len(raw_summary) else 0
+    if len(screened):
+        status_ok = screened.get("분석상태", pd.Series("", index=screened.index)).astype(str).eq("성공")
+        score_ok = screened.get("현재점수_임계값충족", pd.Series(False, index=screened.index)).fillna(False).astype(bool)
+        score_pass_count = int((status_ok & score_ok).sum())
+    else:
+        score_pass_count = 0
+    if len(raw_summary):
+        successful_rows = raw_summary.get("분석상태", pd.Series("", index=raw_summary.index)).astype(str).eq("성공")
+        holdout_sample_count = int((successful_rows & (pd.to_numeric(raw_summary.get("홀드아웃표본수", pd.Series(np.nan, index=raw_summary.index)), errors="coerce") >= 50)).sum())
+        baseline_better_count = int((successful_rows & (pd.to_numeric(raw_summary.get("홀드아웃정밀도_%", pd.Series(np.nan, index=raw_summary.index)), errors="coerce") > pd.to_numeric(raw_summary.get("홀드아웃기저율_%", pd.Series(np.nan, index=raw_summary.index)), errors="coerce"))).sum())
+    else:
+        holdout_sample_count = 0
+        baseline_better_count = 0
+    review_count = int(group_counts.get("매수검토", 0))
+    observe_count = int(group_counts.get("관찰", 0))
+    excluded_count = int(group_counts.get("매수제외", 0))
+
+    info_rows = [
+        {"구분": "버전", "값": SCRIPT_VERSION},
+        {"구분": "분석시장", "값": config.get("시장")},
+        {"구분": "요청 분석 종목 수", "값": config.get("요청종목수")},
+        {"구분": "실제 처리 종목 수", "값": len(raw_summary)},
+        {"구분": "모델 분석 성공 종목 수", "값": succeeded},
+        {"구분": "표본 진단 데이터 확보 종목 수", "값": data_diag},
+        {"구분": "실패/수집오류 종목 수", "값": failures},
+        {"구분": "현재 모델 점수 ≥ 정밀도 기준 임계값 종목 수", "값": score_pass_count},
+        {"구분": "홀드아웃 분류 표본 50개 이상 종목 수", "값": holdout_sample_count},
+        {"구분": "홀드아웃 정밀도 > 기저율 종목 수", "값": baseline_better_count},
+        {"구분": "1차 스크린 통과 종목 수(매수검토+관찰)", "값": len(raw_eligible)},
+        {"구분": "매수검토 그룹 종목 수", "값": review_count},
+        {"구분": "관찰 그룹 종목 수", "값": observe_count},
+        {"구분": "매수제외 그룹 종목 수", "값": excluded_count},
+        {"구분": "전체 종합순위 부여 종목 수", "값": len(screened)},
+        {"구분": "데이터 종료 기준", "값": "FinanceDataReader 호출 시점의 최근 제공 데이터"},
+        {"구분": "모델 원본", "값": f"{CORE_FILENAME} | SHA-256: {core_hash} | 별도 파일 불필요"},
+        {"구분": "목표 상승률 (%)", "값": config.get("목표수익률_%")},
+        {"구분": "최대 보유 거래일", "값": config.get("최대보유거래일")},
+        {"구분": "수수료 (%/편도)", "값": config.get("수수료_%_편도")},
+        {"구분": "슬리피지 (%/편도)", "값": config.get("슬리피지_%_편도")},
+        {"구분": "1차 스크리닝 기준", "값": "분석 성공 + 점수≥임계값 + 홀드아웃 표본≥50 + 정밀도>기저율 + 신호≥30 + 비중복 거래≥30 + 평균 순수익률>0 + CAGR>0"},
+        {"구분": "2차 스크리닝 기준", "값": "정밀도≥50% + 홀드아웃 개선폭≥5%p + 독립 5차 WFO 개선폭≥5%p + 부트스트랩 95% CI 하한>홀드아웃 기저율"},
+        {"구분": "그룹 내 순위 기준", "값": "정밀도 순위 + 평균 순수익률 순위; 합계 오름차순, 동점이면 평균 순수익률 내림차순 후 정밀도 내림차순, 최종 동점은 티커 오름차순"},
+        {"구분": "전체 종합순위", "값": "매수검토 → 관찰 → 매수제외 그룹 순으로 정렬; 그룹별 순위를 각 그룹에서 1위부터 부여하고 전체순위는 연속 부여"},
+        {"구분": "상세 분석", "값": "최종 운용 판정은 단일종목 v3.6.2의 기존 기준으로 별도 확인"},
+        {"구분": "생존편향 주의", "값": "현재 구성종목 목록을 사용하므로 과거 구성종목 변경/상폐 종목이 완전 복원되지 않을 수 있음"},
+        {"구분": "라벨 중첩 주의", "값": "20거래일 목표 라벨이 서로 겹칠 수 있어 양성 라벨 행 수는 독립 급등 사건 수가 아님"},
+        {"구분": "미국 종목 환율", "값": "미국 주식 수익률은 현지 통화 기준; 환율 효과는 v3.6.2와 같이 별도 반영하지 않음"},
+        {"구분": "가격 데이터 출처", "값": "FinanceDataReader: fdr.DataReader(ticker)"},
+        {"구분": "종목 목록 출처", "값": universe_source},
+        {"구분": "기본 ATR 배수", "값": "v3.6.2 기존 ATR(14) × 2.0 규칙 유지"},
+        {"구분": "부트스트랩", "값": f"{config.get('최대보유거래일')}거래일 이동 블록; 반복 {BOOTSTRAP_REPS}회; 95% 구간. 홀드아웃이 최대 보유 기간의 2배 미만이면 산출하지 않고 이유 기재"},
+    ]
+    summary_sheet = pd.DataFrame(info_rows)
+    if len(dist):
+        summary_sheet = pd.concat([summary_sheet, pd.DataFrame([{"구분": "", "값": ""},
+            {"구분": "표본·성능 관측 분포", "값": "분포통계 시트 참조"}])], ignore_index=True)
+
+    cfg_df = pd.DataFrame([{"설정": k, "값": v} for k, v in config.items()])
+    criteria = build_criteria_sheet(core_hash, universe_source, _int_value(config.get("최대보유거래일"), DEFAULT_MAX_HOLDING))
+    screening_criteria = build_screening_criteria_sheet()
+
+    # All rows are shown: groups are fixed in priority order and each group has its own rank.
+    display_summary = _rename_display_columns(screened)
+    preferred_columns = [
+        "전체 종합순위", "스크리닝 그룹", "그룹별 순위", "정밀도 순위(그룹 내)",
+        "평균 순수익률 순위(그룹 내)", "순위 합계", "순위 산정 상태", "분류 사유",
+        "1차 스크린 통과", "2차 스크린 통과", "티커", "기업명", "시장", "업종", "세부업종",
+        "분석상태", "현재 모델 신호 기준 충족", "모델 점수(보정된 성공확률 아님)", "정밀도 기준 임계값",
+        "홀드아웃 분류 표본", "홀드아웃 매수 신호", "비중복 실제 거래", "홀드아웃 정밀도",
+        "홀드아웃 기저율", "홀드아웃 정밀도 개선폭", "독립 5차 WFO 정밀도",
+        "독립 5차 WFO 기저율", "독립 5차 WFO 정밀도 개선폭(%p)", "독립 5차 WFO 검증 표본",
+        "평균 순수익률(비용 차감)", "CAGR", "MDD", "Calmar 비율", "정밀도 95% CI 하한(블록 부트스트랩)",
+        "현재 모델 신호", "원본 v3.6.2 운용 판정"
+    ]
+    present_first = [c for c in preferred_columns if c in display_summary.columns]
+    remaining = [c for c in display_summary.columns if c not in present_first]
+    display_summary = display_summary[present_first + remaining]
+    display_dist = _rename_display_columns(dist)
+    display_segments = _rename_display_columns(pd.DataFrame(records.get("segments", [])))
+    display_folds = _rename_display_columns(pd.DataFrame(records.get("folds", [])))
+    display_holdout = _rename_display_columns(pd.DataFrame(records.get("holdout", [])))
+    display_thresholds = _rename_display_columns(pd.DataFrame(records.get("thresholds", [])))
+    display_trades = _rename_display_columns(pd.DataFrame(records.get("trades", [])))
+    display_errors = _rename_display_columns(pd.DataFrame(records.get("errors", [])))
+
+    sheets = {
+        "요약": summary_sheet,
+        "분포통계": display_dist,
+        "전체종목": display_summary,
+        "표본구간": display_segments,
+        "WFO차수별": display_folds,
+        "홀드아웃성과": display_holdout,
+        "임계값비교": display_thresholds,
+        "거래성과": display_trades,
+        "실패기록": display_errors,
+        "기준_분류": criteria,
+        "스크리닝_기준": screening_criteria,
+        "실행설정": cfg_df,
+    }
+    _save_excel(output_path, sheets, config)
+
+def _prepare_cached_diagnostics(core, raw, target_pct, max_holding, fee_pct, slippage_pct, captured_oof):
+    try:
+        return sample_diagnostics_from_raw(core, raw, target_pct, max_holding, fee_pct, slippage_pct, captured_oof)
+    except Exception as exc:
+        return ({"해석주의": f"표본 진단 계산 실패: {type(exc).__name__}: {exc}"}, [])
+
+
+def analyze_one(core, meta: dict, target_pct: float, max_holding: int,
+                fee_pct: float, slippage_pct: float) -> tuple[dict, list, list, list, list, list]:
+    """Run the exact v3.6.2 pipeline using one FDR download; capture its WFO rows without changing return values."""
+    ticker = str(meta["티커"])
+    company = str(meta.get("기업명") or ticker)
+    raw = None
+    captured_oof: list[dict] = []
+    log_lines = []
+    result = None
+    original_data_reader = core.fdr.DataReader
+    original_get_name = core.get_stock_name
+    original_wfo = core.walk_forward_oof
+    try:
+        raw = original_data_reader(ticker)
+        if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
+            raise RuntimeError("FinanceDataReader가 빈 가격 데이터를 반환했습니다.")
+        # The wrappers only reuse the single downloaded frame, capture already-created WFO diagnostics,
+        # and avoid a redundant KRX name lookup. Model functions/parameters and returned predictions stay unchanged.
+        core.fdr.DataReader = lambda _symbol, *args, **kwargs: raw.copy()
+        core.get_stock_name = lambda _symbol: company
+        def _capture_wfo(*args, **kwargs):
+            out = original_wfo(*args, **kwargs)
+            captured_oof.extend(out or [])
+            return out
+        core.walk_forward_oof = _capture_wfo
+        with tempfile.TemporaryDirectory(prefix=f"{SCRIPT_VERSION}_{re.sub(r'[^A-Za-z0-9_-]', '_', ticker)}_") as temp_dir:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(temp_dir)  # Per-company charts are written to a temporary folder, not cluttering user files.
+                from io import StringIO
+                buffer = StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    result = core.run_pipeline(ticker, target_pct, max_holding, fee_pct, slippage_pct)
+                log_lines = [line for line in buffer.getvalue().splitlines() if line.strip()]
+            finally:
+                os.chdir(old_cwd)
+    except Exception as exc:
+        log_lines.append(f"{type(exc).__name__}: {exc}")
+    finally:
+        core.fdr.DataReader = original_data_reader
+        core.get_stock_name = original_get_name
+        core.walk_forward_oof = original_wfo
+
+    if result is not None:
+        diag = result.get("sample_diagnostics", {})
+        fold_items = diag.get("워크포워드차수별", [])
+        fold_performance = {int(x.get("구간번호")): x for x in result.get("walk_forward_folds", []) if x.get("구간번호") is not None}
+        merged_fold_items = []
+        for item in fold_items:
+            merged = dict(item)
+            try:
+                merged.update(fold_performance.get(int(item.get("차수")), {}))
+            except (TypeError, ValueError):
+                pass
+            merged_fold_items.append(merged)
+        segments = _segment_rows(meta, diag, "v3.6.2 run_pipeline 진단")
+        folds = _fold_rows(meta, merged_fold_items, "v3.6.2 실제 표본 진단")
+        seed = zlib.crc32(ticker.encode("utf-8")) & 0xFFFFFFFF
+        threshold_rows, ci_by_name = _threshold_rows(core, meta, result, seed, block_length=max_holding)
+        holdout_rows = []
+        for row in threshold_rows:
+            holdout_rows.append({k: v for k, v in row.items()})
+        trade = result.get("holdout_trade_metrics", {})
+        trade_row = {"시장": meta.get("시장"), "티커": ticker, "기업명": company, **trade,
+                     "운용판정_v3_6_2": result.get("operating_judgement", {}).get("판정")}
+        summary = _make_summary_row(meta, "성공", " | ".join(log_lines[-3:]), diag, result, ci_by_name)
+        return summary, segments, folds, holdout_rows, [trade_row], []
+
+    # Failed model pipeline can still yield sample-count evidence, using only original v3.6.2 helpers.
+    if raw is not None and isinstance(raw, pd.DataFrame) and not raw.empty:
+        diag, fold_items = _prepare_cached_diagnostics(core, raw, target_pct, max_holding, fee_pct, slippage_pct, captured_oof)
+        if "전체유효라벨" in diag:
+            status = "표본진단만 가능(모델파이프라인 미완료)"
+        else:
+            status = "분석오류(표본진단 실패)"
+        segments = _segment_rows(meta, diag, "v3.6.2 함수로 표본만 산출; 예측 성능은 미실행/미완료")
+        folds = _fold_rows(meta, fold_items, "실제 WFO 수집 또는 분할 규칙상 표본 수만 산출")
+    else:
+        diag, segments, folds = {}, [], []
+        status = "가격데이터 수집 실패"
+    reason = " | ".join(log_lines[-6:]) if log_lines else "v3.6.2 run_pipeline이 결과를 반환하지 않음"
+    summary = _make_summary_row(meta, status, reason, diag, None, {})
+    error_row = {"시장": meta.get("시장"), "티커": ticker, "기업명": company, "분석상태": status,
+                 "세부메시지": reason[:2000], "가격데이터행수": len(raw) if isinstance(raw, pd.DataFrame) else 0,
+                 "WFO실제수집행수": len(captured_oof), "조치": "표본 수가 확보되면 표본구간 시트에 기록; 모델 파이프라인 결과가 없는 성능지표는 공란 유지"}
+    return summary, segments, folds, [], [], [error_row]
+
+
+def prompt_value(label: str, default: float, min_value: float, max_value: float, integer: bool = False):
+    raw = input(f"{label} [기본값 {default}]: ").strip()
+    value = default if not raw else (int(raw) if integer else float(raw))
+    if value < min_value or value > max_value:
+        raise ValueError(f"{label} 값은 {min_value}~{max_value} 범위여야 합니다.")
+    return int(value) if integer else float(value)
+
+
+def _load_checkpoint_records(path: Path, config: dict) -> dict:
+    existing = _checkpoint_load(path, config)
+    needed = ["summary", "segments", "folds", "holdout", "thresholds", "trades", "errors", "processed_tickers"]
+    if existing is None:
+        return {k: [] for k in needed}
+    for k in needed:
+        existing.setdefault(k, [])
+    return existing
+
+
+def main():
+    print("=" * 78)
+    print("급등주 투자검토 우선순위 풀스크리너 v2.0")
+    print("원본 모델: v3.6.2 그대로 사용 | 가격·종목목록: FinanceDataReader 전용")
+    print("분류 기준: 1차(표본·신호·거래·순수익률·CAGR) → 2차(정밀도·개선폭·독립 WFO·CI)")
+    print("=" * 78)
+    try:
+        core = load_core_module()
+    except Exception as exc:
+        print(f"실행할 수 없습니다: {exc}")
+        return
+
+    print("시장 선택: 1) KOSPI  2) S&P 500")
+    market_choice = input("선택 번호 [1]: ").strip() or "1"
+    if market_choice not in ("1", "2"):
+        print("시장 선택은 1 또는 2여야 합니다.")
+        return
+    market = "KOSPI" if market_choice == "1" else "S&P 500"
+    try:
+        universe, universe_source = load_stock_universe(core, market)
+    except Exception as exc:
+        print(f"종목 목록을 가져오지 못했습니다: {exc}")
+        return
+    total_universe = len(universe)
+    if total_universe == 0:
+        print("FinanceDataReader 종목 목록이 비어 있습니다.")
+        return
+    print(f"선택 시장: {market} | FinanceDataReader 목록 종목 수: {total_universe}")
+    count_text = input("분석할 기업 수를 입력하세요 (예: 100, 500 또는 전체) [전체]: ").strip()
+    if not count_text or count_text.lower() in {"전체", "all", "a", "모두"}:
+        requested_count = total_universe
+        count_label = "전체"
+    else:
+        try:
+            requested_count = int(count_text)
+            if requested_count < 1:
+                raise ValueError
+            requested_count = min(requested_count, total_universe)
+            count_label = str(requested_count)
+        except ValueError:
+            print("기업 수는 양의 정수(예: 100, 500) 또는 '전체'로 입력해 주세요.")
+            return
+    target_pct = DEFAULT_TARGET_PCT
+    max_holding = DEFAULT_MAX_HOLDING
+    fee_pct = DEFAULT_FEE_PCT
+    slippage_pct = DEFAULT_SLIPPAGE_PCT
+    print("\nv3.6.2와 동일한 기본 설정입니다. 비교 목적이면 모든 종목에 동일 설정을 사용하세요.")
+    print(f"목표수익률 +{target_pct:.2f}% | 최대 보유 {max_holding}거래일 | 수수료 {fee_pct:.3f}%/편도 | 슬리피지 {slippage_pct:.3f}%/편도")
+    edit = input("기본 설정을 변경할까요? (y/N): ").strip().lower()
+    if edit in {"y", "yes", "예"}:
+        try:
+            target_pct = prompt_value("목표수익률 (%)", target_pct, 0.1, 500.0)
+            max_holding = prompt_value("최대 보유 거래일", max_holding, 1, 252, integer=True)
+            fee_pct = prompt_value("매매수수료 (%/편도)", fee_pct, 0.0, 10.0)
+            slippage_pct = prompt_value("슬리피지 (%/편도)", slippage_pct, 0.0, 10.0)
+        except ValueError as exc:
+            print(f"입력값 오류: {exc}")
+            return
+    if input(f"{market} {count_label}개 종목의 분석을 시작할까요? (Y/n): ").strip().lower() not in {"", "y", "yes", "예"}:
+        print("사용자가 취소했습니다.")
+        return
+
+    selected = universe.head(requested_count).copy().reset_index(drop=True)
+    core_hash = CORE_SOURCE_SHA256
+    universe_fingerprint = hashlib.sha256("\n".join(universe["티커"].astype(str).tolist()).encode("utf-8")).hexdigest()
+    config = {
+        "버전": SCRIPT_VERSION, "시장": market, "요청종목수": count_label,
+        "목록전체종목수": total_universe, "목록출처": universe_source,
+        "목표수익률_%": target_pct, "최대보유거래일": max_holding,
+        "수수료_%_편도": fee_pct, "슬리피지_%_편도": slippage_pct,
+        "ATR배수_v3_6_2": ATR_MULTIPLE, "부트스트랩반복수": BOOTSTRAP_REPS,
+        "부트스트랩블록길이_거래일": max_holding,
+        "유니버스_SHA256": universe_fingerprint, "v3_6_2_SHA256": core_hash,
+        "주가출처": "FinanceDataReader: fdr.DataReader(ticker)",
+        "종목목록출처": universe_source,
+        "현재구성종목기준": True,
+    }
+    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path.cwd() / f"stock_screener_v1_2_output_{market.replace(' ', '').replace('&', '')}"
+    output_path = output_dir / f"stock_screener_v2_0_{market.replace(' ', '').replace('&', '')}_{stamp}.xlsx"
+    checkpoint_path = output_dir / f"stock_screener_v2_0_{market.replace(' ', '').replace('&', '')}_checkpoint.json"
+    legacy_checkpoint_paths = [
+        output_dir / f"stock_screener_v1_2_3_{market.replace(' ', '').replace('&', '')}_checkpoint.json",
+        output_dir / f"stock_screener_v1_2_2_{market.replace(' ', '').replace('&', '')}_checkpoint.json",
+    ]
+    records = _load_checkpoint_records(checkpoint_path, config)
+    if not checkpoint_path.exists():
+        for legacy_checkpoint_path in legacy_checkpoint_paths:
+            if legacy_checkpoint_path.exists():
+                legacy_records = _checkpoint_load(legacy_checkpoint_path, config)
+                if legacy_records is not None:
+                    records = legacy_records
+                    print(f"{legacy_checkpoint_path.name}의 기존 모델 분석 결과를 재사용합니다. 모델 계산은 다시 수행하지 않습니다.")
+                    break
+    processed = set(map(str, records.get("processed_tickers", [])))
+    # If checkpoint has previously screened tickers beyond the requested count, export only selected tickers.
+    allowed = set(selected["티커"].astype(str))
+    for key in ["summary", "segments", "folds", "holdout", "thresholds", "trades", "errors"]:
+        records[key] = [r for r in records.get(key, []) if str(r.get("티커", "")) in allowed]
+    records["processed_tickers"] = [t for t in processed if t in allowed]
+    processed = set(records["processed_tickers"])
+    todo = selected[~selected["티커"].astype(str).isin(processed)]
+    print(f"\n분석 대상 {len(selected)}개 | 체크포인트에서 재사용 {len(processed)}개 | 신규 처리 {len(todo)}개")
+    print("전체 분석은 종목별 WFO 모델 학습을 수행하므로, 500개/전체는 상당한 시간이 걸릴 수 있습니다.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    total_to_do = len(todo)
+    for num, (_, sr) in enumerate(todo.iterrows(), start=1):
+        meta = sr.to_dict()
+        ticker = str(meta["티커"])
+        print(f"[{num}/{total_to_do}] {ticker} · {meta.get('기업명', ticker)} 분석 중...", flush=True)
+        summary, segments, folds, holdouts, trades, errors = analyze_one(
+            core, meta, target_pct, max_holding, fee_pct, slippage_pct)
+        records["summary"].append(_safe(summary))
+        records["segments"].extend(_safe(segments))
+        records["folds"].extend(_safe(folds))
+        records["holdout"].extend(_safe([r for r in holdouts if r.get("임계값선택목표") == "정밀도"]))
+        records["thresholds"].extend(_safe(holdouts))  # all three v3.6.2 threshold candidates carry CIs
+        records["trades"].extend(_safe(trades))
+        records["errors"].extend(_safe(errors))
+        records.setdefault("processed_tickers", []).append(ticker)
+        processed.add(ticker)
+        if num % 5 == 0 or num == total_to_do:
+            _checkpoint_save(checkpoint_path, config, records)
+        print(f"    상태: {summary.get('분석상태')} | 유효라벨: {summary.get('전체유효라벨표본수')} | 홀드아웃: {summary.get('홀드아웃표본수')}")
+
+    _checkpoint_save(checkpoint_path, config, records)
+    # Deduplicate by ticker/section/threshold in case of a resumed run or older checkpoint.
+    def _dedupe(rows, keys):
+        seen, out = set(), []
+        for row in rows:
+            key = tuple(str(row.get(k, "")) for k in keys)
+            if key not in seen:
+                seen.add(key); out.append(row)
+        return out
+    for key, cols in [("summary", ["티커"]), ("segments", ["티커", "구간"]),
+                      ("folds", ["티커", "차수"]), ("holdout", ["티커"]),
+                      ("thresholds", ["티커", "임계값선택목표"]), ("trades", ["티커"]),
+                      ("errors", ["티커"])]:
+        records[key] = _dedupe(records.get(key, []), cols)
+    build_workbook(output_path, records, config, core_hash, universe_source)
+    print("\n엑셀 생성 및 재열기 검증이 완료되었습니다.")
+    print(f"파일: {output_path}")
+    summary_df = _screen_universe(pd.DataFrame(records.get("summary", [])), pd.DataFrame(records.get("folds", [])))
+    if not summary_df.empty:
+        print("\n전체 목록 정렬: 매수검토 → 관찰 → 매수제외 | 각 그룹 내 순위는 별도 산정")
+        print("그룹별 순위 = 정밀도 순위 + 평균 순수익률 순위; 순위 합계가 낮을수록 우선")
+        print("그룹별 종목 수: " + " | ".join(f"{g} {int((summary_df['스크리닝그룹'] == g).sum())}개" for g in ("매수검토", "관찰", "매수제외")))
+        cols = [c for c in ["전체종합순위", "스크리닝그룹", "그룹별순위", "티커", "기업명", "홀드아웃정밀도_%", "평균순수익률_%", "정밀도순위", "평균순수익률순위", "순위합계", "스크리닝판정사유"] if c in summary_df.columns]
+        print("\n전체 종합순위 상위 15개(그룹 우선순위 반영):")
+        print(summary_df[cols].head(15).to_string(index=False))
+    print("\n엑셀 시트: 요약, 분포통계, 전체종목, 표본구간, WFO차수별, 홀드아웃성과, 임계값비교, 거래성과, 실패기록, 기준_분류, 스크리닝_기준, 실행설정")
+    print("다음 실행에서는 체크포인트를 이용해 이미 처리한 종목을 재사용할 수 있습니다.")
+    # Auto-download when executed in Colab; otherwise the path above is the saved output.
+    try:
+        from google.colab import files  # type: ignore
+        files.download(str(output_path))
+    except Exception:
+        print("Colab 자동 다운로드를 사용할 수 없는 환경입니다. 위 파일 경로에서 엑셀을 열거나 내려받으세요.")
+
+
+if __name__ == "__main__":
+    main()
