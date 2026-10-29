@@ -230,6 +230,9 @@ if run_scan:
 
 result = st.session_state.get("scan_result")
 if result:
+    # Streamlit reruns the script on download-button clicks; restore the engine
+    # in this render pass because run_scan is False on subsequent reruns.
+    engine = get_engine()
     ranked = result["ranked"]
     st.markdown('<div class="section-title">분석 결과 요약</div>', unsafe_allow_html=True)
     if ranked is not None and not ranked.empty:
